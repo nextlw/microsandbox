@@ -46,3 +46,31 @@ __pycache__/
 env/
 venv/
 .venv/
+# Elai Code local artifacts
+.elai/settings.local.json
+.elai/sessions/
+.elai/index/
+
+# microsandbox
+.menv/
+Sandboxfile*
+libkrunfw.*
+libkrun.*
+.sandbox-home/
+.sandbox-tmp/
+**/vendor/
+
+# Cargo
+**/target/
+**/target/**
+**/target/**/**
+**/target/**/**/**
+**/target/**/**/**/**
+**/target/**/**/**/**/**
+**/target/**/**/**/**/**/**
+**/target/**/**/**/**/**/**/**
+**/target/**/**/**/**/**/**/**/**
+**/target/**/**/**/**/**/**/**/**/**
+vendor/
+vendor/**
+

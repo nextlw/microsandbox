@@ -36,6 +36,7 @@ members = [
     "examples/rust/snapshot-fork",
     "examples/rust/volume-disk",
     "examples/rust/volume-named",
+    "examples/rust/hello-sandbox",
     "sdk/node-ts",
     "sdk/python",
     "sdk/go/native",
