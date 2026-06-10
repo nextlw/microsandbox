@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = sb_patched.shell("ls -la /app/data").await?;
     println!("   /app/data: {}", output.stdout()?.trim());
 
-    sb_patched.stop_and_wait().await?;
+    sb_patched.stop().await?;
     Sandbox::remove("hello-patched").await?;
     println!("   ✓ sandbox 'hello-patched' removida\n");
 
@@ -214,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = sb_vol.shell("df -h /scratch | tail -1").await?;
     println!("   tmpfs: {}", output.stdout()?.trim());
 
-    sb_vol.stop_and_wait().await?;
+    sb_vol.stop().await?;
     Sandbox::remove("hello-volumes").await?;
     println!("   ✓ sandbox 'hello-volumes' removida\n");
 
@@ -253,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("   HTTP: (conteúdo vazio — domínio pode estar bloqueado)");
     }
 
-    sb_net.stop_and_wait().await?;
+    sb_net.stop().await?;
     Sandbox::remove("hello-network").await?;
     println!("   ✓ sandbox 'hello-network' removida\n");
 
@@ -275,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = sb_port.shell("apk add -q lighttpd && echo 'servidor web instalado'").await?;
     println!("   {}", output.stdout()?.trim());
 
-    sb_port.stop_and_wait().await?;
+    sb_port.stop().await?;
     Sandbox::remove("hello-ports").await?;
     println!("   ✓ sandbox 'hello-ports' removida\n");
 
@@ -303,7 +303,7 @@ echo "Setup concluído"
         println!("   {line}");
     }
 
-    sb_script.stop_and_wait().await?;
+    sb_script.stop().await?;
     Sandbox::remove("hello-scripts").await?;
     println!("   ✓ sandbox 'hello-scripts' removida\n");
 
@@ -337,7 +337,7 @@ echo "Setup concluído"
     // ───────────────────────────────────────────────────────────
     println!("── 11. Logs ────────────────────────────────────────");
 
-    let logs = sb.logs(&Default::default())?;
+    let logs = sb.logs(&Default::default()).await?;
     println!("   {} entradas de log capturadas", logs.len());
     for entry in logs.iter().rev().take(5).rev() {
         let text = String::from_utf8_lossy(&entry.data);
@@ -366,9 +366,10 @@ echo "Setup concluído"
     let handle = Sandbox::get("hello-sandbox").await?;
     println!("   Handle: name={}, status={:?}", handle.name(), handle.status());
 
-    // Parada graciosa
-    let exit_status = sb.stop_and_wait().await?;
-    println!("   Sandbox parou com código {:?}", exit_status.code());
+    // Parada graciosa (`stop` agora é unit; pra exit code use `wait_until_stopped`
+    // antes — ver microsandbox 0.5.6 API).
+    sb.stop().await?;
+    println!("   Sandbox parou (stop concluído)");
 
     // Remover do banco
     Sandbox::remove("hello-sandbox").await?;
