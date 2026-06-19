@@ -325,7 +325,10 @@ mod tests {
             tokio::spawn(async move { bridge.stream_next(1).await })
         };
 
+        assert_eq!(bridge.open_stream_count().await, 1);
+
         bridge.close().await;
+        assert_eq!(bridge.open_stream_count().await, 0);
         let result = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .unwrap()
