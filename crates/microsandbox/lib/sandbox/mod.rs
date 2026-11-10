@@ -72,6 +72,24 @@ use self::exec::{ExecEvent, ExecHandle, ExecOptions, ExecSink, StdinMode};
 /// truncation.
 pub const MAX_SANDBOX_NAME_BYTES: usize = microsandbox_metrics::SLOT_NAME_BYTES;
 
+/// How long before a run's `started_at` its runtime process may have been born.
+///
+/// The runtime inserts its run row near the top of `run()`: after redirecting
+/// its logs, creating the runtime directory, and connecting to the database
+/// (30s connect timeout by default), and before the VM boots. A genuine
+/// runtime is therefore seconds older than its row; the margin covers a host
+/// under heavy load without coming near the weeks that separate a stale row
+/// from whatever process inherited its PID.
+const RUN_PROCESS_STARTUP_WINDOW: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+
+/// How far after a run's `started_at` its runtime process may appear to have
+/// been born.
+///
+/// Only clock noise: the boot time behind a process start time has one-second
+/// resolution, and the wall clock can be stepped after boot. A process born
+/// any later than this cannot have inserted the row.
+const RUN_PROCESS_CLOCK_SLACK: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -1780,7 +1798,7 @@ pub(super) async fn reconcile_sandbox_runtime_state(
         return Ok(sandbox);
     };
 
-    if run.pid.is_some_and(pid_is_alive) {
+    if live_run_pid(&run).is_some() {
         return Ok(sandbox);
     }
 
@@ -1910,8 +1928,7 @@ async fn filter_sandbox_ids(
 }
 
 fn pid_from_run(run: Option<&run_entity::Model>) -> Option<i32> {
-    run.and_then(|model| model.pid)
-        .filter(|pid| pid_is_alive(*pid))
+    run.and_then(live_run_pid)
 }
 
 async fn mark_sandbox_runtime_stale(
@@ -2002,6 +2019,102 @@ pub(super) fn pid_is_alive(pid: i32) -> bool {
         std::io::Error::last_os_error().raw_os_error(),
         Some(code) if code == libc::EPERM
     )
+}
+
+/// The run's PID, but only while it still belongs to the runtime that
+/// recorded it.
+///
+/// [`pid_is_alive`] answers whether *some* process holds the PID, not whether
+/// it is the runtime that inserted this row. A row can outlive its runtime
+/// without being updated — the runtime killed from outside, or the database
+/// carried into another PID namespace, as when a containerised host is
+/// replaced by a native one — and the number then belongs to an unrelated
+/// process. On Linux that can be a kernel thread, which answers `EPERM` for as
+/// long as the host is up. Reading that as alive wedges the sandbox for good:
+/// `start()` refuses it as already running, `remove()` refuses it as still
+/// running, the reaper never marks it `Crashed`, and a forced replacement
+/// would signal a process that is not ours.
+///
+/// The runtime inserts its row right after it starts, so a genuine runtime
+/// was born shortly before `started_at`. Where the birth time cannot be read
+/// (no `/proc`, or a row without `started_at`) this falls back to
+/// [`pid_is_alive`] alone, which is what every caller relied on before.
+fn live_run_pid(run: &run_entity::Model) -> Option<i32> {
+    let pid = run.pid.filter(|pid| pid_is_alive(*pid))?;
+
+    match (run.started_at, process_start_time(pid)) {
+        (Some(run_started), Some(process_started))
+            if !process_started_for_run(process_started, run_started) =>
+        {
+            None
+        }
+        _ => Some(pid),
+    }
+}
+
+/// Whether a process born at `process_started` can be the runtime of a run
+/// recorded at `run_started`. See [`RUN_PROCESS_STARTUP_WINDOW`] and
+/// [`RUN_PROCESS_CLOCK_SLACK`] for the bounds.
+fn process_started_for_run(
+    process_started: chrono::NaiveDateTime,
+    run_started: chrono::NaiveDateTime,
+) -> bool {
+    process_started >= run_started - RUN_PROCESS_STARTUP_WINDOW
+        && process_started <= run_started + RUN_PROCESS_CLOCK_SLACK
+}
+
+/// When the process holding `pid` was born, in UTC, or `None` when it cannot
+/// be told.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: i32) -> Option<chrono::NaiveDateTime> {
+    let pid_stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let host_stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let ticks_per_second = u64::try_from(ticks_per_second).ok()?;
+
+    process_start_from_proc(&pid_stat, &host_stat, ticks_per_second)
+}
+
+/// When the process holding `pid` was born, in UTC, or `None` when it cannot
+/// be told.
+#[cfg(not(target_os = "linux"))]
+fn process_start_time(_pid: i32) -> Option<chrono::NaiveDateTime> {
+    None
+}
+
+/// A process's birth time from the contents of `/proc/<pid>/stat` and
+/// `/proc/stat`.
+///
+/// `starttime` (field 22 of `/proc/<pid>/stat`) counts clock ticks since boot,
+/// and `btime` in `/proc/stat` is the boot instant in Unix seconds. The fields
+/// are read after the *last* `)`: the command name before it may itself
+/// contain spaces and parentheses.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn process_start_from_proc(
+    pid_stat: &str,
+    host_stat: &str,
+    ticks_per_second: u64,
+) -> Option<chrono::NaiveDateTime> {
+    if ticks_per_second == 0 {
+        return None;
+    }
+
+    // After the command name, `state` is field 3, so `starttime` (field 22)
+    // is the 20th whitespace-separated value.
+    let after_name = &pid_stat[pid_stat.rfind(')')? + 1..];
+    let start_ticks: u64 = after_name.split_whitespace().nth(19)?.parse().ok()?;
+
+    let boot_seconds: i64 = host_stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+
+    let seconds = boot_seconds.checked_add(i64::try_from(start_ticks / ticks_per_second).ok()?)?;
+    let nanos = (start_ticks % ticks_per_second) * 1_000_000_000 / ticks_per_second;
+
+    chrono::DateTime::from_timestamp(seconds, u32::try_from(nanos).ok()?).map(|at| at.naive_utc())
 }
 
 fn digest_pinned_reference(reference: &str, manifest_digest: &str) -> MicrosandboxResult<String> {
@@ -2315,12 +2428,9 @@ async fn stop_sandbox_for_replacement(
     grace: std::time::Duration,
 ) -> MicrosandboxResult<()> {
     let run = load_active_run(pools.read(), sandbox.id).await?;
-    let pids: Vec<i32> = run
-        .as_ref()
-        .and_then(|model| model.pid)
-        .filter(|pid| pid_is_alive(*pid))
-        .into_iter()
-        .collect();
+    // Identity, not just existence: these PIDs get SIGTERM and then SIGKILL,
+    // and a number this row no longer owns would land on someone else.
+    let pids: Vec<i32> = run.as_ref().and_then(live_run_pid).into_iter().collect();
 
     if !pids.is_empty() {
         // Polite phase: SIGTERM and wait up to `grace` for graceful exit.
@@ -2761,8 +2871,9 @@ mod tests {
         HostPermissions, MAX_SANDBOX_NAME_BYTES, RootfsSource, SandboxConfig, SandboxFilter,
         SandboxStatus, StatVirtualization, VolumeMount, digest_pinned_reference,
         filter_sandbox_ids, insert_sandbox_record, persist_oci_manifest_pin, prepare_create_target,
-        reconcile_sandbox_runtime_state, remove_dir_if_exists, validate_labels,
-        validate_rootfs_source, validate_sandbox_name_for_runtime,
+        process_start_from_proc, process_started_for_run, reconcile_sandbox_runtime_state,
+        remove_dir_if_exists, validate_labels, validate_rootfs_source,
+        validate_sandbox_name_for_runtime,
     };
 
     /// Open both pools at `db_path` for tests, with migrations applied.
@@ -3610,6 +3721,156 @@ mod tests {
             Some(run_entity::TerminationReason::InternalError)
         );
         assert!(run.terminated_at.is_some());
+    }
+
+    /// Insert a `Running` row for `pid` and return the reconciled sandbox.
+    async fn reconcile_live_pid(
+        name: &str,
+        pid: i32,
+        started_at: Option<chrono::NaiveDateTime>,
+    ) -> super::sandbox_entity::Model {
+        let temp = tempdir().unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
+
+        let config = SandboxConfig {
+            name: name.into(),
+            ..Default::default()
+        };
+        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
+        let run = run_entity::ActiveModel {
+            sandbox_id: Set(sandbox_id),
+            pid: Set(Some(pid)),
+            status: Set(run_entity::RunStatus::Running),
+            started_at: Set(started_at),
+            ..Default::default()
+        };
+        run_entity::Entity::insert(run)
+            .exec(pools.write())
+            .await
+            .unwrap();
+
+        let sandbox = super::sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.write())
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_sandbox_runtime_state(&pools, sandbox)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_keeps_live_pid_when_the_row_has_no_start_time() {
+        // Without `started_at` there is no identity to check, so a live PID
+        // keeps the existence-only answer every caller relied on before.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+
+        let reconciled = reconcile_live_pid("no-start-time", child.id() as i32, None).await;
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(reconciled.status, SandboxStatus::Running);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_reconcile_keeps_live_pid_born_with_its_run() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let started_at = chrono::Utc::now().naive_utc();
+
+        let reconciled =
+            reconcile_live_pid("born-with-run", child.id() as i32, Some(started_at)).await;
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(reconciled.status, SandboxStatus::Running);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_reconcile_marks_crashed_when_the_pid_was_recycled_after_the_run() {
+        // The row says the run started a month ago; the process now holding
+        // its PID was born just now. It is alive, and it is not the runtime.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let started_at = chrono::Utc::now().naive_utc() - chrono::TimeDelta::days(30);
+
+        let reconciled =
+            reconcile_live_pid("recycled-pid", child.id() as i32, Some(started_at)).await;
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(reconciled.status, SandboxStatus::Crashed);
+    }
+
+    fn at(unix_seconds: i64) -> chrono::NaiveDateTime {
+        chrono::DateTime::from_timestamp(unix_seconds, 0)
+            .unwrap()
+            .naive_utc()
+    }
+
+    #[test]
+    fn test_process_started_for_run_accepts_a_runtime_born_just_before_its_row() {
+        let run_started = at(1_791_000_000);
+
+        assert!(process_started_for_run(run_started, run_started));
+        assert!(process_started_for_run(at(1_790_999_995), run_started));
+        // Clock noise past the row is tolerated.
+        assert!(process_started_for_run(at(1_791_000_001), run_started));
+    }
+
+    #[test]
+    fn test_process_started_for_run_rejects_a_process_born_long_before_the_row() {
+        // What wedged a host: rows written on 2026-10-07 inside a container
+        // kept PIDs that, on the host, belong to kernel threads born at boot
+        // on 2026-09-04. Those threads answer EPERM to `kill(pid, 0)` forever.
+        let run_written_in_container = at(1_791_397_899); // 2026-10-07 18:31:39 UTC
+        let kernel_thread_born_at_boot = at(1_788_555_951); // 2026-09-04 21:05:51 UTC
+
+        assert!(!process_started_for_run(
+            kernel_thread_born_at_boot,
+            run_written_in_container
+        ));
+    }
+
+    #[test]
+    fn test_process_started_for_run_rejects_a_process_born_after_the_row() {
+        let run_started = at(1_791_000_000);
+
+        assert!(!process_started_for_run(at(1_791_003_600), run_started));
+    }
+
+    #[test]
+    fn test_process_start_from_proc_counts_fields_after_the_last_paren() {
+        // The command name may hold spaces and parentheses of its own.
+        let pid_stat = "4242 (weird ) name) S 1 4242 4242 0 -1 4194560 100 0 0 0 7 3 0 0 20 0 1 0 \
+                        4321 1000 200 18446744073709551615";
+        let host_stat = "cpu  1 2 3 4\nbtime 1756846000\nprocesses 99\n";
+
+        let started = process_start_from_proc(pid_stat, host_stat, 100).unwrap();
+
+        // 4321 ticks at 100 Hz is 43.21 s after boot.
+        let expected = chrono::DateTime::from_timestamp(1_756_846_043, 210_000_000)
+            .unwrap()
+            .naive_utc();
+        assert_eq!(started, expected);
+    }
+
+    #[test]
+    fn test_process_start_from_proc_returns_none_on_unreadable_input() {
+        let pid_stat = "1 (init) S 0 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 50 0 0 0";
+        let host_stat = "btime 1756846000\n";
+
+        assert_eq!(
+            process_start_from_proc("no name here", host_stat, 100),
+            None
+        );
+        assert_eq!(
+            process_start_from_proc("1 (init) S 0 1", host_stat, 100),
+            None
+        );
+        assert_eq!(process_start_from_proc(pid_stat, "cpu 1 2 3\n", 100), None);
+        assert_eq!(process_start_from_proc(pid_stat, host_stat, 0), None);
+        assert!(process_start_from_proc(pid_stat, host_stat, 100).is_some());
     }
 
     #[tokio::test]
