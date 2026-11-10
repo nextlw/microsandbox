@@ -132,7 +132,7 @@ jobs:
             os: linux
             agentd_target: aarch64-unknown-linux-musl
           - target: darwin-aarch64
-            runner: macos-14
+            runner: macos-15
             arch: aarch64
             os: darwin
 

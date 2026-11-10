@@ -134,7 +134,7 @@ jobs:
             agentd_target: aarch64-unknown-linux-musl
             libkrunfw_file: libkrunfw.so.5.2.1
           - target: darwin-aarch64
-            runner: macos-14
+            runner: macos-15
             arch: aarch64
             os: darwin
             libkrunfw_file: libkrunfw.5.dylib
