@@ -26,7 +26,7 @@ jobs:
   # ---------------------------------------------------------------------------
   changes:
     name: Detect code changes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, build]
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -122,7 +122,7 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
-            runner: ubuntu-latest
+            runner: [self-hosted, build]
             arch: x86_64
             os: linux
             agentd_target: x86_64-unknown-linux-musl
@@ -142,6 +142,13 @@ jobs:
           submodules: true
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: runner.environment == 'github-hosted'
+
+      - name: Set up Rust (tlw-3)
+        if: runner.environment == 'self-hosted'
+        uses: ./.github/actions/setup-rust-self-hosted
+        with:
+          targets: ${{ matrix.agentd_target }}
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -149,7 +156,7 @@ jobs:
 
       # -- Linux build deps --
       - name: Install build deps (Linux)
-        if: matrix.os == 'linux'
+        if: matrix.os == 'linux' && runner.environment == 'github-hosted'
         run: sudo apt-get update && sudo apt-get install -y musl-tools libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
 
       # -- agentd (Linux: native musl) --
@@ -239,7 +246,7 @@ jobs:
       - build-kernel
       - build-agentd-aarch64
       - test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, build]
     steps:
       - name: Aggregate results
         run: |
