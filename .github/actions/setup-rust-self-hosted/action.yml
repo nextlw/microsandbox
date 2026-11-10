@@ -1,0 +1,79 @@
+name: Set up Rust (shared self-hosted runner)
+description: >-
+  For the [self-hosted, build] runners on tlw-3, where every runner runs as the
+  same user and shares one rustup install with other repositories' CI. Uses that
+  rustup, installs only what is missing and only under a lock, and gives this
+  runner its own CARGO_HOME. Same approach as nextlw/temps
+  (.github/actions/setup-rust).
+
+inputs:
+  components:
+    description: Space- or comma-separated rustup components (e.g. "rustfmt clippy").
+    required: false
+    default: ""
+  targets:
+    description: Space- or comma-separated rustup targets.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Use the runner's rustup toolchain
+      shell: bash
+      env:
+        RUST_COMPONENTS: ${{ inputs.components }}
+        RUST_TARGETS: ${{ inputs.targets }}
+      run: |
+        set -euo pipefail
+        # The account's home, not $HOME: a job may point HOME at a directory of
+        # its own (see "Give this runner its own HOME" in check.yml), and the
+        # toolchain must still be found where it is installed.
+        real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+        cargo_bin="$real_home/.cargo/bin"
+        # rustup and its proxies live in the shared ~/.cargo/bin. Everything
+        # else cargo writes goes to a CARGO_HOME of this runner: rust-cache's
+        # post step deletes files in $CARGO_HOME/bin it did not see installed,
+        # and on the shared directory that would remove rustup for every other
+        # job on the machine.
+        runner_cargo_home="$real_home/cargo-home/${RUNNER_NAME:?}"
+        mkdir -p "$runner_cargo_home/bin"
+        echo "$cargo_bin" >> "$GITHUB_PATH"
+        echo "$runner_cargo_home/bin" >> "$GITHUB_PATH"
+        echo "CARGO_HOME=$runner_cargo_home" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${RUSTUP_HOME:-$real_home/.rustup}" >> "$GITHUB_ENV"
+        export PATH="$cargo_bin:$PATH"
+        export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
+
+        # One rustup change at a time across every runner on the machine. The
+        # lock file is the same one nextlw/temps uses.
+        exec 9>"$real_home/.rustup-ci.lock"
+        if ! flock --wait 900 9; then
+          echo "::error::timed out waiting for the shared rustup lock ($real_home/.rustup-ci.lock)"
+          exit 1
+        fi
+
+        if ! command -v rustup >/dev/null 2>&1; then
+          echo "::error::rustup is missing in $cargo_bin; installing the toolchain is an administrator task on the machine"
+          exit 1
+        fi
+        if ! rustup toolchain list | grep -q '^stable'; then
+          rustup toolchain install stable --profile minimal --no-self-update
+        fi
+
+        installed_components="$(rustup component list --toolchain stable --installed)"
+        for component in ${RUST_COMPONENTS//,/ }; do
+          if ! grep -q "^${component}\(-\|$\)" <<<"$installed_components"; then
+            rustup component add --toolchain stable "$component"
+          fi
+        done
+        installed_targets="$(rustup target list --toolchain stable --installed)"
+        for target in ${RUST_TARGETS//,/ }; do
+          if ! grep -qx "$target" <<<"$installed_targets"; then
+            rustup target add --toolchain stable "$target"
+          fi
+        done
+
+        flock --unlock 9
+        rustc +stable --version
+        cargo +stable --version

@@ -11,12 +11,15 @@ rm -rf "${GITHUB_WORKSPACE:-$PWD}"/target
 rm -rf "${HOME}/.microsandbox"
 
 # Self-hosted x64 runners share one root disk across multiple runner users.
+# Without sudo (the tlw-3 runners) only this user's own directories go.
+SUDO=""
+if sudo -n true 2>/dev/null; then SUDO=sudo; fi
 # Clean only old temp directories so active jobs keep their per-test homes.
-sudo find /tmp -mindepth 1 -maxdepth 1 -type d \
+$SUDO find /tmp -mindepth 1 -maxdepth 1 -type d \
   \( -name 'msb-*' -o -name 'TestSandbox*' -o -name 'go-build*' \) \
   -mmin +120 -exec rm -rf {} + 2>/dev/null || true
 
-sudo find /tmp -mindepth 1 -maxdepth 1 -type d \
+$SUDO find /tmp -mindepth 1 -maxdepth 1 -type d \
   \( -name 'codex-*' -o -name 'microsandbox-*' -o -name 'libkrun-*' \) \
   -mmin +360 -exec rm -rf {} + 2>/dev/null || true
 
