@@ -1,7 +1,7 @@
 [package]
 name = "microsandbox"
 description = "`microsandbox` is the core library for the microsandbox project."
-version.workspace = true
+version = "0.5.7"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
